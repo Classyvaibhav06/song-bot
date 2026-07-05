@@ -6,6 +6,7 @@ import subprocess
 import threading
 from collections import defaultdict
 from pathlib import Path
+from shutil import which
 from instagrapi import Client
 
 # Rate Limiter
@@ -75,6 +76,7 @@ def download_and_convert(query, downloads_dir):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     ytdlp_path = os.path.join(base_dir, 'yt-dlp.exe')
     ffmpeg_path = os.path.join(base_dir, 'ffmpeg.exe')
+    cookies_path = os.path.join(base_dir, 'cookies.txt')
     
     if not os.path.exists(ytdlp_path):
         ytdlp_path = 'yt-dlp'
@@ -87,6 +89,15 @@ def download_and_convert(query, downloads_dir):
     ffmpeg_opt = []
     if os.path.exists(ffmpeg_path):
         ffmpeg_opt = ["--ffmpeg-location", base_dir]
+
+    ytdlp_opt = []
+    if os.path.exists(cookies_path):
+        ytdlp_opt.extend(["--cookies", cookies_path])
+
+    for runtime_name in ("node", "deno"):
+        if which(runtime_name):
+            ytdlp_opt.extend(["--js-runtimes", runtime_name])
+            break
         
     cmd = [
         ytdlp_path,
@@ -99,7 +110,7 @@ def download_and_convert(query, downloads_dir):
         "--print", "title",
         "--print", "id",
         "--no-simulate"
-    ] + ffmpeg_opt
+    ] + ffmpeg_opt + ytdlp_opt
     
     print(f"[{datetime.datetime.now().isoformat()}] Searching YouTube for: \"{query}\"")
     result = subprocess.run(cmd, capture_output=True, text=True)
