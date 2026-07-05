@@ -32,7 +32,7 @@ def log_interaction(level, sender_id, command, status, details=None):
     log_file = os.path.join(log_dir, "interactions.log")
     
     entry = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "level": level,
         "senderId": sender_id,
         "command": command,
@@ -102,7 +102,15 @@ def download_and_convert(query, downloads_dir):
     ] + ffmpeg_opt
     
     print(f"[{datetime.datetime.now().isoformat()}] Searching YouTube for: \"{query}\"")
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(
+            "yt-dlp failed with exit code {}\nstdout: {}\nstderr: {}".format(
+                result.returncode,
+                result.stdout.strip(),
+                result.stderr.strip(),
+            )
+        )
     
     lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
     if len(lines) < 3:
