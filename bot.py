@@ -260,7 +260,7 @@ def main():
                 for msg in new_messages:
                     # Mark thread as seen up to this message
                     try:
-                        cl.direct_send_seen(msg.id)
+                        cl.direct_send_seen(thread_id=thread.id)
                     except Exception as e:
                         print(f"Could not send seen receipt: {e}")
                         
