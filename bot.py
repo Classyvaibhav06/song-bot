@@ -5,9 +5,16 @@ import datetime
 import subprocess
 import threading
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
+from typing import Optional, Sequence
 from instagrapi import Client
+
+try:
+    from youtubesearchpython import VideosSearch
+except Exception:
+    VideosSearch = None
 
 # Rate Limiter
 class RateLimiter:
@@ -71,96 +78,222 @@ def start_download_cleanup_worker(downloads_dir, interval_seconds=10, max_age_se
     thread.start()
     return thread
 
-# Audio Search & Download Pipeline
-def download_and_convert(query, downloads_dir):
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    ytdlp_path = os.path.join(base_dir, 'yt-dlp.exe')
-    ffmpeg_path = os.path.join(base_dir, 'ffmpeg.exe')
-    cookies_path = os.path.join(base_dir, 'cookies.txt')
-    
-    if not os.path.exists(ytdlp_path):
-        ytdlp_path = 'yt-dlp'
-    if not os.path.exists(ffmpeg_path):
-        ffmpeg_path = 'ffmpeg'
-        
-    os.makedirs(downloads_dir, exist_ok=True)
-    output_template = os.path.join(downloads_dir, "%(id)s.%(ext)s")
-    
-    ffmpeg_opt = []
-    if os.path.exists(ffmpeg_path):
-        ffmpeg_opt = ["--ffmpeg-location", base_dir]
+@dataclass
+class YouTubeDownloadError(Exception):
+    message: str
+    fallback_link: Optional[str] = None
 
-    ytdlp_opt = []
-    if os.path.exists(cookies_path):
-        ytdlp_opt.extend(["--cookies", cookies_path])
+    def __str__(self):
+        return self.message
 
-    for runtime_name in ("node", "deno"):
-        if which(runtime_name):
-            ytdlp_opt.extend(["--js-runtimes", runtime_name])
-            break
-        
-    cmd = [
-        ytdlp_path,
-        f"ytsearch1:{query}",
-        "-x",
-        "--audio-format", "mp3",
-        "--no-playlist",
-        "-o", output_template,
-        "--print", "filename",
-        "--print", "title",
-        "--print", "id",
-        "--no-simulate"
-    ] + ffmpeg_opt + ytdlp_opt
-    
-    print(f"[{datetime.datetime.now().isoformat()}] Searching YouTube for: \"{query}\"")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(
-            "yt-dlp failed with exit code {}\nstdout: {}\nstderr: {}".format(
-                result.returncode,
-                result.stdout.strip(),
-                result.stderr.strip(),
+
+class YouTubeDownloader:
+    def __init__(
+        self,
+        downloads_dir: str = "downloads",
+        cookies_path: str = "cookies.txt",
+        player_profiles: Sequence[Sequence[str]] = (("android", "web"), ("mweb", "web"), ("ios", "web"), ("web",)),
+        js_runtimes: Sequence[str] = ("node", "deno"),
+    ):
+        self.base_dir = Path(__file__).resolve().parent
+        self.downloads_dir = Path(downloads_dir)
+        self.cookies_path = self.base_dir / cookies_path
+        self.ytdlp_path = self._resolve_binary(self.base_dir / "yt-dlp.exe", "yt-dlp")
+        self.ffmpeg_path = self._resolve_binary(self.base_dir / "ffmpeg.exe", "ffmpeg")
+        self.player_profiles = tuple(tuple(profile) for profile in player_profiles)
+        self.js_runtimes = tuple(js_runtimes)
+        self._cookies_validated = False
+        self.downloads_dir.mkdir(parents=True, exist_ok=True)
+
+    def _resolve_binary(self, local_path: Path, fallback_name: str) -> str:
+        if local_path.exists():
+            return str(local_path)
+        return which(fallback_name) or fallback_name
+
+    def _cookie_args(self) -> list[str]:
+        if self.cookies_path.exists() and self.cookies_path.stat().st_size > 0:
+            return ["--cookies", str(self.cookies_path)]
+        return []
+
+    def _js_runtime_args(self) -> list[str]:
+        for runtime_name in self.js_runtimes:
+            if which(runtime_name):
+                return ["--js-runtimes", runtime_name]
+        return []
+
+    def _player_client_args(self, profile: Sequence[str]) -> list[str]:
+        if not profile:
+            return []
+        return ["--extractor-args", f"youtube:player_client={','.join(profile)}"]
+
+    def _search_link(self, query: str) -> Optional[str]:
+        if VideosSearch is None:
+            return None
+        try:
+            result = VideosSearch(query, limit=1).result()
+            items = result.get("result", [])
+            if not items:
+                return None
+            return items[0].get("link")
+        except Exception:
+            return None
+
+    def validate_cookies(self) -> bool:
+        if not self.cookies_path.exists():
+            return False
+        if self.cookies_path.stat().st_size < 100:
+            raise YouTubeDownloadError("cookies.txt exists but looks empty or invalid")
+
+        test_cmd = [
+            self.ytdlp_path,
+            "--quiet",
+            "--no-warnings",
+            "--skip-download",
+            "--cookies",
+            str(self.cookies_path),
+            "--print",
+            "title",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ] + self._js_runtime_args() + self._player_client_args(("android", "web"))
+
+        result = subprocess.run(test_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise YouTubeDownloadError(
+                "Cookie validation failed\nstdout: {}\nstderr: {}".format(
+                    result.stdout.strip(),
+                    result.stderr.strip(),
+                ),
+                fallback_link=self._search_link("Rick Astley Never Gonna Give You Up"),
             )
-        )
-    
-    lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
-    if len(lines) < 3:
-        raise Exception(f"Failed to parse yt-dlp output. stdout: {result.stdout}")
-        
-    mp3_path = lines[0]
-    title = lines[1]
-    video_id = lines[2]
-    
-    # Fallback check if yt-dlp named the file differently
-    if not os.path.exists(mp3_path):
-        expected_path = os.path.join(downloads_dir, f"{video_id}.mp3")
-        if os.path.exists(expected_path):
-            mp3_path = expected_path
-        else:
-            raise Exception(f"Downloaded audio file not found at: {mp3_path}")
-            
-    print(f"[{datetime.datetime.now().isoformat()}] Downloaded: \"{title}\" (ID: {video_id})")
-    
-    # Convert to compliant voice note format (m4a, mono, 16000Hz, AAC)
-    voice_note_filename = f"{video_id}_voice.m4a"
-    voice_note_path = os.path.join(downloads_dir, voice_note_filename)
-    
-    ffmpeg_cmd = [
-        ffmpeg_path,
-        "-y",
-        "-i", mp3_path,
-        "-acodec", "aac",
-        "-ac", "1",
-        "-ar", "16000",
-        "-t", "60", # limit to 60s max duration
-        voice_note_path
-    ]
-    
-    print(f"[{datetime.datetime.now().isoformat()}] Converting audio to Voice Note format...")
-    subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
-    print(f"[{datetime.datetime.now().isoformat()}] Conversion successful: {voice_note_path}")
-    
-    return voice_note_path, title, mp3_path
+
+        self._cookies_validated = True
+        return True
+
+    def _build_download_cmd(self, target: str, profile: Sequence[str]) -> list[str]:
+        output_template = str(self.downloads_dir / "%(id)s.%(ext)s")
+        cmd = [
+            self.ytdlp_path,
+            target,
+            "-x",
+            "--audio-format",
+            "mp3",
+            "--no-playlist",
+            "--no-cache-dir",
+            "--retries",
+            "3",
+            "--fragment-retries",
+            "3",
+            "--socket-timeout",
+            "30",
+            "-o",
+            output_template,
+            "--print",
+            "filename",
+            "--print",
+            "title",
+            "--print",
+            "id",
+            "--no-simulate",
+        ]
+
+        if self.ffmpeg_path and Path(self.ffmpeg_path).exists():
+            cmd.extend(["--ffmpeg-location", str(Path(self.ffmpeg_path).parent)])
+
+        cmd.extend(self._cookie_args())
+        cmd.extend(self._js_runtime_args())
+        cmd.extend(self._player_client_args(profile))
+        return cmd
+
+    def _run_download(self, cmd: list[str]) -> subprocess.CompletedProcess:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise YouTubeDownloadError(
+                "yt-dlp failed with exit code {}\nstdout: {}\nstderr: {}".format(
+                    result.returncode,
+                    result.stdout.strip(),
+                    result.stderr.strip(),
+                )
+            )
+        return result
+
+    def download_and_convert(self, query: str, attempts: int = 2):
+        if self.cookies_path.exists() and not self._cookies_validated:
+            self.validate_cookies()
+
+        last_error: Optional[Exception] = None
+        fallback_link = self._search_link(query)
+        target = f"ytsearch1:{query}"
+
+        for profile in self.player_profiles:
+            for attempt in range(1, attempts + 1):
+                try:
+                    result = self._run_download(self._build_download_cmd(target, profile))
+                    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                    if len(lines) < 3:
+                        raise YouTubeDownloadError(f"Failed to parse yt-dlp output:\n{result.stdout}")
+
+                    mp3_path = Path(lines[0])
+                    title = lines[1]
+                    video_id = lines[2]
+
+                    if not mp3_path.exists():
+                        candidate = self.downloads_dir / f"{video_id}.mp3"
+                        if candidate.exists():
+                            mp3_path = candidate
+                        else:
+                            raise YouTubeDownloadError(f"Downloaded audio file not found at: {mp3_path}")
+
+                    voice_note_path = self.downloads_dir / f"{video_id}_voice.m4a"
+                    ffmpeg_cmd = [
+                        self.ffmpeg_path,
+                        "-y",
+                        "-i",
+                        str(mp3_path),
+                        "-acodec",
+                        "aac",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-t",
+                        "60",
+                        str(voice_note_path),
+                    ]
+                    ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    if ffmpeg_result.returncode != 0:
+                        raise YouTubeDownloadError(
+                            "ffmpeg failed with exit code {}\nstdout: {}\nstderr: {}".format(
+                                ffmpeg_result.returncode,
+                                ffmpeg_result.stdout.strip(),
+                                ffmpeg_result.stderr.strip(),
+                            )
+                        )
+
+                    return voice_note_path, title, mp3_path
+
+                except YouTubeDownloadError as exc:
+                    last_error = exc
+                    error_text = str(exc).lower()
+                    if any(marker in error_text for marker in ("sign in to confirm", "cookies", "not a bot", "login", "403", "bot")):
+                        break
+                    if attempt < attempts:
+                        time.sleep(2 * attempt)
+                        continue
+                    break
+
+        if isinstance(last_error, YouTubeDownloadError):
+            if not last_error.fallback_link and fallback_link:
+                last_error.fallback_link = fallback_link
+            raise last_error
+
+        raise YouTubeDownloadError("Download failed", fallback_link=fallback_link)
+
+
+downloader = YouTubeDownloader()
+
+
+def download_and_convert(query, downloads_dir):
+    return downloader.download_and_convert(query)
 
 def main():
     config_path = "config.json"
@@ -302,7 +435,17 @@ def main():
                                 
                         except Exception as pipeline_err:
                             print(f"Pipeline error: {pipeline_err}")
-                            cl.direct_send(f"Sorry, I could not download or process \"{query}\" right now.", thread_ids=[thread_id])
+                            fallback_link = getattr(pipeline_err, "fallback_link", None)
+                            if fallback_link:
+                                cl.direct_send(
+                                    f"I could not send audio for \"{query}\" right now, but here is the YouTube link:\n{fallback_link}",
+                                    thread_ids=[thread_id],
+                                )
+                            else:
+                                cl.direct_send(
+                                    f"Sorry, I could not download or process \"{query}\" right now.",
+                                    thread_ids=[thread_id],
+                                )
                             log_interaction("error", sender_id, "$play", "failed", {"query": query, "error": str(pipeline_err)})
                             
                     elif text == "$help":

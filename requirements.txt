@@ -1,2 +1,3 @@
 instagrapi
 pydantic
+youtube-search-python
