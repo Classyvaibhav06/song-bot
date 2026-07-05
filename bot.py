@@ -145,6 +145,12 @@ class YouTubeDownloader:
         except Exception:
             return None
 
+    def _resolve_target(self, query: str) -> tuple[str, Optional[str]]:
+        link = self._search_link(query)
+        if link:
+            return link, link
+        return f"ytsearch1:{query}", None
+
     def validate_cookies(self) -> bool:
         if not self.cookies_path.exists():
             return False
@@ -228,8 +234,7 @@ class YouTubeDownloader:
             self.validate_cookies()
 
         last_error: Optional[Exception] = None
-        fallback_link = self._search_link(query)
-        target = f"ytsearch1:{query}"
+        target, fallback_link = self._resolve_target(query)
 
         for profile in self.player_profiles:
             for attempt in range(1, attempts + 1):
