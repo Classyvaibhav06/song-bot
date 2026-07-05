@@ -1,4 +1,5 @@
 import json
+import uuid
 import os
 import time
 import datetime
@@ -7,9 +8,14 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from shutil import which
 from typing import Optional, Sequence
 from instagrapi import Client
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("Warning: python-dotenv not installed. Using existing environment variables.")
 
 try:
     from youtubesearchpython import VideosSearch
@@ -51,6 +57,24 @@ def log_interaction(level, sender_id, command, status, details=None):
         
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+import music
+
+# Send Instagram Native Music Attachment (Using music.py configuration)
+def send_music_attachment(cl, thread_id, query, sender_id):
+    try:
+        # Call the new robust Web GraphQL implementation from music.py
+        result = music.play_song(query, str(sender_id), "User", thread_id, cl)
+        
+        # If it returns a string, that means GraphQL failed and it provided an iTunes fallback
+        if result and isinstance(result, str):
+            cl.direct_send(result, thread_ids=[thread_id])
+            
+    except Exception as e:
+        print(f"[{datetime.datetime.now().isoformat()}] Error sending music attachment: {e}")
+        cl.direct_send(f"Sorry, I could not send the music card for \"{query}\" right now.", thread_ids=[thread_id])
+        log_interaction("error", sender_id, "/music", "failed", {"query": query, "error": str(e)})
 
 def cleanup_downloads(downloads_dir, max_age_seconds=10):
     if not os.path.exists(downloads_dir):
@@ -110,6 +134,7 @@ class YouTubeDownloader:
         self.player_profiles = tuple(tuple(profile) for profile in player_profiles)
         self.js_runtimes = tuple(js_runtimes)
         self._cookies_validated = False
+        self._cookies_enabled = False
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
     def _resolve_binary(self, local_path: Path, fallback_name: str) -> str:
@@ -118,9 +143,25 @@ class YouTubeDownloader:
         return which(fallback_name) or fallback_name
 
     def _cookie_args(self) -> list[str]:
-        if self.cookies_path.exists() and self.cookies_path.stat().st_size > 0:
+        if self._cookies_enabled and self.cookies_path.exists() and self.cookies_path.stat().st_size > 0:
             return ["--cookies", str(self.cookies_path)]
         return []
+
+    def _looks_like_netscape_cookie_file(self) -> bool:
+        if not self.cookies_path.exists() or self.cookies_path.stat().st_size == 0:
+            return False
+
+        try:
+            with self.cookies_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    return len(stripped.split("\t")) >= 7
+        except Exception:
+            return False
+
+        return False
 
     def _js_runtime_args(self) -> list[str]:
         for runtime_name in self.js_runtimes:
@@ -152,10 +193,8 @@ class YouTubeDownloader:
         return f"ytsearch1:{query}", None
 
     def validate_cookies(self) -> bool:
-        if not self.cookies_path.exists():
+        if not self._looks_like_netscape_cookie_file():
             return False
-        if self.cookies_path.stat().st_size < 100:
-            raise YouTubeDownloadError("cookies.txt exists but looks empty or invalid")
 
         test_cmd = [
             self.ytdlp_path,
@@ -172,15 +211,15 @@ class YouTubeDownloader:
         result = subprocess.run(test_cmd, capture_output=True, text=True)
         if result.returncode == 0:
             self._cookies_validated = True
+            self._cookies_enabled = True
             return True
 
-        raise YouTubeDownloadError(
-            "Cookie validation failed\nstdout: {}\nstderr: {}".format(
-                result.stdout.strip(),
-                result.stderr.strip(),
-            ),
-            fallback_link=self._search_link("Rick Astley Never Gonna Give You Up"),
+        print(
+            "Cookie validation failed; continuing without cookies. "
+            "stdout: {} stderr: {}".format(result.stdout.strip(), result.stderr.strip())
         )
+        self._cookies_enabled = False
+        return False
 
     def _build_download_cmd(self, target: str, profile: Sequence[str]) -> list[str]:
         output_template = str(self.downloads_dir / "%(id)s.%(ext)s")
@@ -230,7 +269,7 @@ class YouTubeDownloader:
         return result
 
     def download_and_convert(self, query: str, attempts: int = 2):
-        if self.cookies_path.exists() and not self._cookies_validated:
+        if not self._cookies_validated:
             self.validate_cookies()
 
         last_error: Optional[Exception] = None
@@ -360,7 +399,12 @@ def main():
             return
             
     bot_user_id = str(cl.user_id)
-    print(f"Bot active. User ID: {bot_user_id}")
+    try:
+        # Get actual username from the session or API, not config
+        bot_username = cl.username if hasattr(cl, 'username') and cl.username else cl.user_info(cl.user_id).username
+    except Exception:
+        bot_username = "penguin.7599967" # fallback
+    print(f"Bot active. User ID: {bot_user_id}, Username: {bot_username}")
     
     rate_limiter = RateLimiter(limit_per_hour)
     start_download_cleanup_worker(downloads_dir, interval_seconds=10, max_age_seconds=10)
@@ -403,14 +447,39 @@ def main():
                     new_messages.reverse()
                     
                 for msg in new_messages:
-                    # Mark thread as seen up to this message
+                    # Best-effort seen receipt; some Instagram endpoints reject this call intermittently.
                     try:
                         cl.direct_send_seen(thread_id=thread.id)
-                    except Exception as e:
-                        print(f"Could not send seen receipt: {e}")
+                    except Exception:
+                        pass
                         
                     text = msg.text.strip() if msg.text else ""
                     sender_id = str(msg.user_id)
+                    
+                    # Detect AI Chat Triggers
+                    is_chat = False
+                    chat_prompt = ""
+                    
+                    if text.startswith("%talk "):
+                        is_chat = True
+                        chat_prompt = text[6:].strip()
+                    elif bot_username and f"@{bot_username.lower()}" in text.lower():
+                        is_chat = True
+                        chat_prompt = text
+                    else:
+                        try:
+                            # Use model_dump for Pydantic V2, fallback to dict for V1
+                            msg_dict = getattr(msg, "model_dump", getattr(msg, "dict", lambda: {}))()
+                            replied_msg = msg_dict.get('replied_to_message') or msg_dict.get('replied_to_action')
+                            if replied_msg and isinstance(replied_msg, dict):
+                                if str(replied_msg.get('user_id', '')) == bot_user_id:
+                                    is_chat = True
+                                    chat_prompt = text
+                                elif 'item' in replied_msg and str(replied_msg['item'].get('user_id', '')) == bot_user_id:
+                                    is_chat = True
+                                    chat_prompt = text
+                        except Exception:
+                            pass
                     
                     if text.startswith("$play "):
                         query = text[6:].strip()
@@ -460,12 +529,68 @@ def main():
                                 )
                             log_interaction("error", sender_id, "$play", "failed", {"query": query, "error": str(pipeline_err)})
                             
-                    elif text == "$help":
-                        help_text = "Commands:\n$play [song name] - search YouTube and send it as a voice note\n$help - show this message"
+                    elif text.startswith("#at "):
+                        query = text[4:].strip()
+                        
+                        if not query:
+                            cl.direct_send("Send #at followed by a song title. Example: #at midnight city", thread_ids=[thread_id])
+                            log_interaction("info", sender_id, "#at", "missing_query")
+                            processed_data[thread_id] = str(msg.id)
+                            continue
+                            
+                        if not rate_limiter.is_allowed(sender_id):
+                            cl.direct_send("You have hit the hourly command limit. Please try again later.", thread_ids=[thread_id])
+                            log_interaction("warn", sender_id, "#at", "rate_limited", {"query": query})
+                            processed_data[thread_id] = str(msg.id)
+                            continue
+                            
+                        send_music_attachment(cl, thread_id, query, sender_id)
+                        
+                    elif is_chat:
+                        if not chat_prompt:
+                            cl.direct_send("Send %talk followed by your message. Example: %talk tell me a joke", thread_ids=[thread_id])
+                            log_interaction("info", sender_id, "%talk", "missing_query")
+                            processed_data[thread_id] = str(msg.id)
+                            continue
+                            
+                        print(f"[{datetime.datetime.now().isoformat()}] Chat request from {sender_id}: {chat_prompt}")
+                        cl.direct_send("Thinking...", thread_ids=[thread_id])
+                        
+                        try:
+                            import requests
+                            url = "https://api.groq.com/openai/v1/chat/completions"
+                            groq_api_key = os.getenv("GROQ_API_KEY", "")
+                            headers = {
+                                "Authorization": f"Bearer {groq_api_key}",
+                                "Content-Type": "application/json"
+                            }
+                            payload = {
+                                "model": "llama-3.1-8b-instant",
+                                "messages": [
+                                    {"role": "system", "content": "You are Ayaan AI, a helpful, cool, and concise AI assistant on Instagram."},
+                                    {"role": "user", "content": chat_prompt}
+                                ],
+                                "max_tokens": 300
+                            }
+                            ai_res = requests.post(url, headers=headers, json=payload, timeout=10)
+                            if ai_res.status_code == 200:
+                                reply = ai_res.json()["choices"][0]["message"]["content"]
+                            else:
+                                print(f"Groq API Error {ai_res.status_code}: {ai_res.text}")
+                                reply = f"Sorry, AI is currently unavailable (Error {ai_res.status_code})."
+                            
+                            cl.direct_send(reply, thread_ids=[thread_id])
+                            log_interaction("info", sender_id, "%talk", "sent")
+                        except Exception as e:
+                            print(f"Error calling Groq API: {e}")
+                            cl.direct_send("Sorry, I encountered an error connecting to my brain.", thread_ids=[thread_id])
+                        
+                    elif text == "$help" or text == "/help":
+                        help_text = "Commands:\n$play [song] - send voice note\n#at [song] - share native music card\n%talk [message] - chat with Ayaan AI\n$help - show this message"
                         cl.direct_send(help_text, thread_ids=[thread_id])
                         log_interaction("info", sender_id, "$help", "sent")
                         
-                    elif text.startswith("$"):
+                    elif text.startswith("$") or text.startswith("/") or text.startswith("#") or text.startswith("%") or text.startswith("!"):
                         cl.direct_send("Unknown command. Type $help for usage.", thread_ids=[thread_id])
                         log_interaction("info", sender_id, text, "unknown_command")
                         
@@ -477,7 +602,7 @@ def main():
         except Exception as loop_err:
             print(f"Error in polling loop iteration: {loop_err}")
             
-        time.sleep(15) # Poll every 15 seconds to stay safe from rate limits
+        time.sleep(3) # Poll every 3 seconds to stay safe from rate limits
 
 if __name__ == "__main__":
     main()
