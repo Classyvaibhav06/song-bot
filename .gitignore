@@ -2,6 +2,7 @@
 session.json
 processed_messages.json
 .env
+cookies.txt
 
 # Windows executables (not needed for Linux VPS)
 ffmpeg.exe
