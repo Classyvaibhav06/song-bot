@@ -1,0 +1,26 @@
+
+{
+  "instagram": {
+    "username": "vot.music",
+    "password": "Ghoshi123@",
+    "sessionid": "16268213647%3AbuJkNOI3ZTURlB%3A7%3AAYiAG5_OdKTdkx0cuvy2EntnuwOvp8KMeU0815ouxA",
+    "sessionFile": "./session.json",
+    "musicSearchDocId": "27152225807728809",
+    "musicSendDocId": "26548947361463418"
+  },
+  "webhook": {
+    "verifyToken": "SET_IG_VERIFY_TOKEN",
+    "appSecret": "SET_IG_APP_SECRET",
+    "pageAccessToken": "SET_IG_PAGE_ACCESS_TOKEN"
+  },
+  "server": {
+    "port": 3000
+  },
+  "limits": {
+    "commandsPerHour": 30,
+    "messagingWindowHours": 24
+  },
+  "paths": {
+    "logFile": "./logs/interactions.log"
+  }
+}

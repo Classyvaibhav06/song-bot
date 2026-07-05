@@ -1,0 +1,16 @@
+{
+  "name": "instagram-music-bot",
+  "version": "1.0.0",
+  "description": "A lightweight Instagram DM bot that responds to user-initiated commands with music links through the Instagram Graph API.",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "test": "node -c bot.js && node -c lib/song-resolver.js && node -c lib/instagram-graph.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

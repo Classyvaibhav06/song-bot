@@ -1,0 +1,18 @@
+# Credentials & Sessions
+session.json
+processed_messages.json
+.env
+
+# Windows executables (not needed for Linux VPS)
+ffmpeg.exe
+ffprobe.exe
+yt-dlp.exe
+
+# Node & Python caches
+node_modules/
+__pycache__/
+*.pyc
+
+# Local runtime files
+downloads/
+logs/
