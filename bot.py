@@ -92,7 +92,14 @@ class YouTubeDownloader:
         self,
         downloads_dir: str = "downloads",
         cookies_path: str = "cookies.txt",
-        player_profiles: Sequence[Sequence[str]] = (("android", "web"), ("mweb", "web"), ("ios", "web"), ("web",)),
+        player_profiles: Sequence[Sequence[str]] = (
+            ("android", "web"),
+            ("android_music", "web"),
+            ("tv_embedded", "web"),
+            ("mweb", "web"),
+            ("ios", "web"),
+            ("web",),
+        ),
         js_runtimes: Sequence[str] = ("node", "deno"),
     ):
         self.base_dir = Path(__file__).resolve().parent
@@ -157,17 +164,17 @@ class YouTubeDownloader:
         ] + self._js_runtime_args() + self._player_client_args(("android", "web"))
 
         result = subprocess.run(test_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise YouTubeDownloadError(
-                "Cookie validation failed\nstdout: {}\nstderr: {}".format(
-                    result.stdout.strip(),
-                    result.stderr.strip(),
-                ),
-                fallback_link=self._search_link("Rick Astley Never Gonna Give You Up"),
-            )
+        if result.returncode == 0:
+            self._cookies_validated = True
+            return True
 
-        self._cookies_validated = True
-        return True
+        raise YouTubeDownloadError(
+            "Cookie validation failed\nstdout: {}\nstderr: {}".format(
+                result.stdout.strip(),
+                result.stderr.strip(),
+            ),
+            fallback_link=self._search_link("Rick Astley Never Gonna Give You Up"),
+        )
 
     def _build_download_cmd(self, target: str, profile: Sequence[str]) -> list[str]:
         output_template = str(self.downloads_dir / "%(id)s.%(ext)s")
