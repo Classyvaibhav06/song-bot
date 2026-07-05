@@ -3,6 +3,7 @@ import os
 import time
 import datetime
 import subprocess
+import threading
 from collections import defaultdict
 from pathlib import Path
 from instagrapi import Client
@@ -42,6 +43,32 @@ def log_interaction(level, sender_id, command, status, details=None):
         
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+
+def cleanup_downloads(downloads_dir, max_age_seconds=10):
+    if not os.path.exists(downloads_dir):
+        return
+
+    now = time.time()
+    for entry_name in os.listdir(downloads_dir):
+        entry_path = os.path.join(downloads_dir, entry_name)
+        try:
+            if os.path.isfile(entry_path) and now - os.path.getmtime(entry_path) >= max_age_seconds:
+                os.remove(entry_path)
+        except Exception as cleanup_err:
+            print(f"Failed to remove {entry_path}: {cleanup_err}")
+
+def start_download_cleanup_worker(downloads_dir, interval_seconds=10, max_age_seconds=10):
+    def worker():
+        while True:
+            try:
+                cleanup_downloads(downloads_dir, max_age_seconds=max_age_seconds)
+            except Exception as cleanup_err:
+                print(f"Cleanup worker error: {cleanup_err}")
+            time.sleep(interval_seconds)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
 
 # Audio Search & Download Pipeline
 def download_and_convert(query, downloads_dir):
@@ -172,6 +199,7 @@ def main():
     print(f"Bot active. User ID: {bot_user_id}")
     
     rate_limiter = RateLimiter(limit_per_hour)
+    start_download_cleanup_worker(downloads_dir, interval_seconds=10, max_age_seconds=10)
     
     # Load processed messages tracker
     processed_data = {}
@@ -252,15 +280,6 @@ def main():
                             cl.direct_send(f"Found: {title}", thread_ids=[thread_id])
                             
                             log_interaction("info", sender_id, "$play", "sent", {"query": query, "title": title})
-                            
-                            # Clean up temporary downloads
-                            try:
-                                if os.path.exists(voice_path):
-                                    os.remove(voice_path)
-                                if os.path.exists(orig_mp3):
-                                    os.remove(orig_mp3)
-                            except Exception as cleanup_err:
-                                print(f"Failed to clean up files: {cleanup_err}")
                                 
                         except Exception as pipeline_err:
                             print(f"Pipeline error: {pipeline_err}")
