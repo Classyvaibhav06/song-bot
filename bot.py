@@ -3,6 +3,8 @@ import uuid
 import os
 import time
 import datetime
+import requests
+import urllib.parse
 import subprocess
 import threading
 from collections import defaultdict
@@ -10,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 from instagrapi import Client
+from shutil import which
 
 try:
     from dotenv import load_dotenv
@@ -418,6 +421,9 @@ def main():
         except Exception:
             processed_data = {}
             
+    # Initialize chat history for memory
+    chat_history = defaultdict(list)
+            
     print("Starting direct message polling loop...")
     while True:
         try:
@@ -460,7 +466,7 @@ def main():
                     is_chat = False
                     chat_prompt = ""
                     
-                    if text.startswith("%talk "):
+                    if text.startswith("#chat "):
                         is_chat = True
                         chat_prompt = text[6:].strip()
                     elif bot_username and f"@{bot_username.lower()}" in text.lower():
@@ -481,23 +487,23 @@ def main():
                         except Exception:
                             pass
                     
-                    if text.startswith("$play "):
+                    if text.startswith("#play "):
                         query = text[6:].strip()
                         
                         if not query:
-                            cl.direct_send("Send $play followed by a song title. Example: $play midnight city", thread_ids=[thread_id])
-                            log_interaction("info", sender_id, "$play", "missing_query")
+                            cl.direct_send("Send #play followed by a song title. Example: #play midnight city", thread_ids=[thread_id])
+                            log_interaction("info", sender_id, "#play", "missing_query")
                             processed_data[thread_id] = str(msg.id)
                             continue
                             
                         if not rate_limiter.is_allowed(sender_id):
                             cl.direct_send("You have hit the hourly command limit. Please try again later.", thread_ids=[thread_id])
-                            log_interaction("warn", sender_id, "$play", "rate_limited", {"query": query})
+                            log_interaction("warn", sender_id, "#play", "rate_limited", {"query": query})
                             processed_data[thread_id] = str(msg.id)
                             continue
                             
-                        print(f"Processing command '$play {query}' from user {sender_id}")
-                        log_interaction("info", sender_id, "$play", "searching", {"query": query})
+                        print(f"Processing command '#play {query}' from user {sender_id}")
+                        log_interaction("info", sender_id, "#play", "searching", {"query": query})
                         
                         # Let the user know the bot is looking for the song
                         cl.direct_send(f"🎵 Searching for \"{query}\"...", thread_ids=[thread_id])
@@ -512,7 +518,7 @@ def main():
                             
                             cl.direct_send(f"Found: {title}", thread_ids=[thread_id])
                             
-                            log_interaction("info", sender_id, "$play", "sent", {"query": query, "title": title})
+                            log_interaction("info", sender_id, "#play", "sent", {"query": query, "title": title})
                                 
                         except Exception as pipeline_err:
                             print(f"Pipeline error: {pipeline_err}")
@@ -548,8 +554,8 @@ def main():
                         
                     elif is_chat:
                         if not chat_prompt:
-                            cl.direct_send("Send %talk followed by your message. Example: %talk tell me a joke", thread_ids=[thread_id])
-                            log_interaction("info", sender_id, "%talk", "missing_query")
+                            cl.direct_send("Send #chat followed by your message. Example: #chat tell me a joke", thread_ids=[thread_id])
+                            log_interaction("info", sender_id, "#chat", "missing_query")
                             processed_data[thread_id] = str(msg.id)
                             continue
                             
@@ -557,41 +563,264 @@ def main():
                         cl.direct_send("Thinking...", thread_ids=[thread_id])
                         
                         try:
-                            import requests
                             url = "https://api.groq.com/openai/v1/chat/completions"
                             groq_api_key = os.getenv("GROQ_API_KEY", "")
                             headers = {
                                 "Authorization": f"Bearer {groq_api_key}",
                                 "Content-Type": "application/json"
                             }
+                            # Manage chat history
+                            chat_history[thread_id].append({"role": "user", "content": chat_prompt})
+                            if len(chat_history[thread_id]) > 10:
+                                chat_history[thread_id] = chat_history[thread_id][-10:]
+                                
+                            messages = [
+                                {"role": "system", "content": "You are Backchod AI, a highly engaging, slightly savage, and witty AI assistant on Instagram. You roast the user a little bit in a fun, human-like way, while still actually helping them out. Keep it concise."}
+                            ]
+                            messages.extend(chat_history[thread_id])
+
                             payload = {
                                 "model": "llama-3.1-8b-instant",
-                                "messages": [
-                                    {"role": "system", "content": "You are Ayaan AI, a helpful, cool, and concise AI assistant on Instagram."},
-                                    {"role": "user", "content": chat_prompt}
-                                ],
+                                "messages": messages,
                                 "max_tokens": 300
                             }
                             ai_res = requests.post(url, headers=headers, json=payload, timeout=10)
                             if ai_res.status_code == 200:
                                 reply = ai_res.json()["choices"][0]["message"]["content"]
+                                chat_history[thread_id].append({"role": "assistant", "content": reply})
                             else:
                                 print(f"Groq API Error {ai_res.status_code}: {ai_res.text}")
                                 reply = f"Sorry, AI is currently unavailable (Error {ai_res.status_code})."
                             
                             cl.direct_send(reply, thread_ids=[thread_id])
-                            log_interaction("info", sender_id, "%talk", "sent")
+                            log_interaction("info", sender_id, "#chat", "sent")
                         except Exception as e:
                             print(f"Error calling Groq API: {e}")
                             cl.direct_send("Sorry, I encountered an error connecting to my brain.", thread_ids=[thread_id])
+                            
+                    elif text.startswith("#speak "):
+                        prompt = text[7:].strip()
+                        if not prompt:
+                            cl.direct_send("Send #speak followed by your message. Example: #speak how are you", thread_ids=[thread_id])
+                            log_interaction("info", sender_id, "#speak", "missing_query")
+                            processed_data[thread_id] = str(msg.id)
+                            continue
+
+                        print(f"[{datetime.datetime.now().isoformat()}] Speak request from {sender_id}: {prompt}")
+                        cl.direct_send("Thinking and recording...", thread_ids=[thread_id])
+
+                        try:
+                            
+                            # Step 1: Get AI Text Response
+                            url = "https://api.groq.com/openai/v1/chat/completions"
+                            groq_api_key = os.getenv("GROQ_API_KEY", "")
+                            headers = {
+                                "Authorization": f"Bearer {groq_api_key}",
+                                "Content-Type": "application/json"
+                            }
+                            # Manage chat history
+                            chat_history[thread_id].append({"role": "user", "content": prompt})
+                            if len(chat_history[thread_id]) > 10:
+                                chat_history[thread_id] = chat_history[thread_id][-10:]
+                                
+                            messages = [
+                                {"role": "system", "content": "You are Backchod AI, a highly engaging, slightly savage, and witty AI assistant on Instagram. You roast the user a little bit in a fun, human-like way, but keep your response conversational, friendly, and very short (under 2 sentences) because you are speaking in a voice note."}
+                            ]
+                            messages.extend(chat_history[thread_id])
+
+                            payload = {
+                                "model": "llama-3.1-8b-instant",
+                                "messages": messages,
+                                "max_tokens": 100
+                            }
+                            ai_res = requests.post(url, headers=headers, json=payload, timeout=10)
+                            if ai_res.status_code == 200:
+                                reply_text = ai_res.json()["choices"][0]["message"]["content"]
+                                chat_history[thread_id].append({"role": "assistant", "content": reply_text})
+                            else:
+                                raise Exception(f"Groq API Error {ai_res.status_code}")
+
+                            # Step 2: Convert to Speech using ElevenLabs
+                            eleven_api_key = os.getenv("ELEVENLABS_API_KEY", "")
+                            
+                            # Dynamically fetch a valid free 'premade' voice to avoid paid plan errors
+                            voice_id = "JBFqnCBsd6RMkjVDRZzb" # default fallback (George)
+                            try:
+                                voices_res = requests.get("https://api.elevenlabs.io/v1/voices", headers={"xi-api-key": eleven_api_key}, timeout=5)
+                                if voices_res.status_code == 200:
+                                    voices = voices_res.json().get("voices", [])
+                                    premade = [v["voice_id"] for v in voices if v.get("category") == "premade"]
+                                    if premade:
+                                        voice_id = premade[0]
+                            except Exception as e:
+                                print(f"Could not fetch voices: {e}")
+                                
+                            tts_url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+                            
+                            tts_headers = {
+                                "xi-api-key": eleven_api_key,
+                                "Content-Type": "application/json"
+                            }
+                            tts_payload = {
+                                "text": reply_text,
+                                "model_id": "eleven_multilingual_v2",
+                                "voice_settings": {
+                                    "stability": 0.5,
+                                    "similarity_boost": 0.5
+                                }
+                            }
+                            
+                            tts_res = requests.post(tts_url, headers=tts_headers, json=tts_payload, timeout=15)
+                            if tts_res.status_code == 200:
+                                unique_id = uuid.uuid4().hex[:8]
+                                mp3_path = os.path.join(downloads_dir, f"speak_{unique_id}.mp3")
+                                mp4_path = os.path.join(downloads_dir, f"speak_{unique_id}.mp4")
+                                
+                                with open(mp3_path, "wb") as f:
+                                    f.write(tts_res.content)
+                                    
+                                # Convert to MP4 using ffmpeg for Instagrapi compatibility
+                                ffmpeg_exe = which("ffmpeg") or os.path.join(Path(__file__).resolve().parent, "ffmpeg.exe")
+                                subprocess.run([
+                                    ffmpeg_exe, "-i", mp3_path, "-c:a", "aac", "-b:a", "128k", mp4_path, "-y"
+                                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    
+                                # Send voice note
+                                cl.direct_send_voice(Path(mp4_path), thread_ids=[thread_id])
+                                log_interaction("info", sender_id, "#speak", "sent")
+                                
+                                # Cleanup
+                                try:
+                                    os.remove(mp3_path)
+                                except Exception:
+                                    pass
+                            else:
+                                print(f"ElevenLabs API Error: {tts_res.text}")
+                                cl.direct_send(f"Sorry, couldn't generate voice. But I would have said: {reply_text}", thread_ids=[thread_id])
+                                
+                        except Exception as e:
+                            print(f"Error in speak command: {e}")
+                            cl.direct_send("Sorry, I encountered an error generating the voice note.", thread_ids=[thread_id])
                         
-                    elif text == "$help" or text == "/help":
-                        help_text = "Commands:\n$play [song] - send voice note\n#at [song] - share native music card\n%talk [message] - chat with Ayaan AI\n$help - show this message"
+                    elif text.startswith("#remind "):
+                        args = text[8:].strip().split(" ", 1)
+                        if len(args) < 2:
+                            cl.direct_send("Invalid format! Example: #remind 5m turn off the stove\nSupported units: s, m, h", thread_ids=[thread_id])
+                        else:
+                            time_str = args[0].lower()
+                            reminder_msg = args[1].strip()
+                            
+                            amount = 0
+                            try:
+                                if time_str.endswith("s"):
+                                    amount = int(time_str[:-1])
+                                elif time_str.endswith("m"):
+                                    amount = int(time_str[:-1]) * 60
+                                elif time_str.endswith("h"):
+                                    amount = int(time_str[:-1]) * 3600
+                                else:
+                                    amount = int(time_str) # default to seconds
+                            except ValueError:
+                                amount = -1
+                                
+                            if amount <= 0:
+                                cl.direct_send("Please provide a valid time (e.g., 10s, 5m, 1h).", thread_ids=[thread_id])
+                            else:
+                                cl.direct_send(f"Okay! I will remind you in {time_str}.", thread_ids=[thread_id])
+                                
+                                def send_reminder(tid, msg):
+                                    try:
+                                        cl.direct_send(f"⏰ REMINDER: {msg}", thread_ids=[tid])
+                                    except Exception as e:
+                                        print(f"Failed to send reminder: {e}")
+                                        
+                                threading.Timer(amount, send_reminder, args=[thread_id, reminder_msg]).start()
+                                log_interaction("info", sender_id, "#remind", "set", {"time": time_str})
+                                
+                    elif text.startswith("#img "):
+                        img_prompt = text[5:].strip()
+                        if not img_prompt:
+                            cl.direct_send("Send #img followed by a prompt. Example: #img a cute cat sitting on a tree", thread_ids=[thread_id])
+                            log_interaction("info", sender_id, "#img", "missing_query")
+                            processed_data[thread_id] = str(msg.id)
+                            continue
+                            
+                        cl.direct_send(f"🎨 Generating image for '{img_prompt}'...", thread_ids=[thread_id])
+                        log_interaction("info", sender_id, "#img", "generating", {"query": img_prompt})
+                        
+                        try:
+                            encoded_prompt = urllib.parse.quote(img_prompt)
+                            img_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+                            
+                            img_res = requests.get(img_url, timeout=30)
+                            if img_res.status_code == 200:
+                                unique_img_id = uuid.uuid4().hex[:8]
+                                img_path = os.path.join(downloads_dir, f"img_{unique_img_id}.jpg")
+                                
+                                with open(img_path, "wb") as f:
+                                    f.write(img_res.content)
+                                    
+                                # Send image
+                                cl.direct_send_photo(Path(img_path), thread_ids=[thread_id])
+                                log_interaction("info", sender_id, "#img", "sent")
+                                
+                                # Cleanup
+                                try:
+                                    os.remove(img_path)
+                                except Exception:
+                                    pass
+                            else:
+                                cl.direct_send(f"Sorry, couldn't generate the image right now. Error {img_res.status_code}", thread_ids=[thread_id])
+                        except Exception as e:
+                            print(f"Error in img command: {e}")
+                            cl.direct_send("Sorry, I encountered an error generating the image.", thread_ids=[thread_id])
+
+                    elif text.startswith("#img1 "):
+                        img_prompt = text[6:].strip()
+                        if not img_prompt:
+                            cl.direct_send("Send #img1 followed by a prompt. Example: #img1 a cool cyberpunk car", thread_ids=[thread_id])
+                            log_interaction("info", sender_id, "#img1", "missing_query")
+                            processed_data[thread_id] = str(msg.id)
+                            continue
+                            
+                        cl.direct_send(f"🚀 Generating uncensored image for '{img_prompt}'...", thread_ids=[thread_id])
+                        log_interaction("info", sender_id, "#img1", "generating", {"query": img_prompt})
+                        
+                        try:
+                            encoded_prompt = urllib.parse.quote(img_prompt)
+                            img_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?model=flux-realism&nologo=true"
+                            
+                            img_res = requests.get(img_url, timeout=45)
+                            
+                            if img_res.status_code == 200:
+                                unique_img_id = uuid.uuid4().hex[:8]
+                                img_path = os.path.join(downloads_dir, f"img1_{unique_img_id}.jpg")
+                                
+                                with open(img_path, "wb") as f:
+                                    f.write(img_res.content)
+                                    
+                                # Send image
+                                cl.direct_send_photo(Path(img_path), thread_ids=[thread_id])
+                                log_interaction("info", sender_id, "#img1", "sent")
+                                
+                                try:
+                                    os.remove(img_path)
+                                except Exception:
+                                    pass
+                            else:
+                                err_text = img_res.json().get("error", "Unknown error") if hasattr(img_res, 'json') else img_res.text
+                                cl.direct_send(f"Sorry, model error: {err_text}", thread_ids=[thread_id])
+                        except Exception as e:
+                            print(f"Error in img1 command: {e}")
+                            cl.direct_send("Sorry, I encountered an error generating the image.", thread_ids=[thread_id])
+
+                    elif text == "#help":
+                        help_text = "Commands:\n#play [song] - send voice note\n#at [song] - share native music card\n#chat [message] - chat with Backchod AI\n#speak [message] - reply with AI voice note\n#remind [time] [msg] - set a reminder\n#img [prompt] - generate image\n#img1 [prompt] - uncensored image\n#help - show this message"
                         cl.direct_send(help_text, thread_ids=[thread_id])
-                        log_interaction("info", sender_id, "$help", "sent")
+                        log_interaction("info", sender_id, "#help", "sent")
                         
-                    elif text.startswith("$") or text.startswith("/") or text.startswith("#") or text.startswith("%") or text.startswith("!"):
-                        cl.direct_send("Unknown command. Type $help for usage.", thread_ids=[thread_id])
+                    elif text.startswith("#"):
+                        cl.direct_send("Unknown command. Type #help for usage.", thread_ids=[thread_id])
                         log_interaction("info", sender_id, text, "unknown_command")
                         
                     # Update tracking
